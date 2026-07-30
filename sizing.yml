@@ -1,0 +1,79 @@
+version: 1
+
+server:
+  host_reserve_mb: 1024        # النظام + dockerd + page cache (اتركه لـ auto بحذف السطر)
+  mem_overcommit: 1.35         # Σlimits ≤ 1.35 × المتاح
+  reservation_ratio: 0.70      # Σreservations ≤ 0.70 × المتاح
+  round_mb: 32
+
+defaults:
+  php:
+    worker_rss_mb: 70          # قِس بـ: rt.py doctor --fpm
+    worker_rss_cli_mb: 110
+    baseline_mb: 45            # nginx + fpm master + supervisor
+    opcache_mb: 96
+    interned_mb: 16
+    memory_limit_mb: 192       # سقف الطلب الواحد
+    max_execution_time: 30
+    cpu_per_request: 0.30      # نصيب النواة لعامل مشغول واحد
+    cpu_ceiling: 0.60          # أقصى نسبة من نوى السيرفر يُسمح للتطبيق ببلوغها
+    min_children: 4
+    max_children_cap: 12
+    peak_workers: 1
+    safety: 2.0
+  redis:
+    overhead_mb: 16
+    fill_ratio: 0.75
+  postgres:
+    work_mem_mb: 4
+    conn_overhead_mb: 7
+    reserve_conns: 6
+
+apps:
+  wttms:
+    class: php-fpm
+    weight: high
+    traffic: { rps_peak: 8, avg_ms: 180 }
+    workers: { queue: 1, scheduler: true }
+    db:    { name: wttms-db,    class: postgres }
+    cache: { name: wttms-redis, class: redis, hot_mb: 48, policy: volatile-lru }
+  station:
+    class: php-fpm
+    weight: high
+    traffic: { rps_peak: 6, avg_ms: 200 }
+    workers: { queue: 1, scheduler: true }
+    db:    { name: station-db,    class: postgres }
+    cache: { name: station-redis, class: redis, hot_mb: 48, policy: volatile-lru }
+  portfolio:
+    class: php-fpm
+    weight: normal
+    traffic: { rps_peak: 3, avg_ms: 120 }
+    overrides: { memory_limit_mb: 128, opcache_mb: 64, worker_rss_mb: 60 }
+    db:    { name: portfolio-db,    class: postgres }
+    cache: { name: portfolio-redis, class: redis, hot_mb: 24, policy: allkeys-lru }
+
+# خدمات غير PHP: profiles ثابتة موزونة
+static:
+  cloudflare_tunnel: { cpu: 0.60, shares: 1024, mem: 128, res: 64,  tier: edge }
+  traefik_gateway:   { cpu: 0.60, shares: 1024, mem: 192, res: 96,  tier: edge }
+  tailscale:         { cpu: 0.30, shares: 800,  mem: 128, res: 48,  tier: edge }
+  n8n-app:           { cpu: 1.00, shares: 512,  mem: 768, res: 256, tier: app }
+  redis-n8n:         { cpu: 0.15, shares: 600,  mem: 96,  res: 48,  tier: data }
+  evo-app:           { cpu: 0.60, shares: 600,  mem: 512, res: 160, tier: app }
+  db-evolution:      { cpu: 0.50, shares: 700,  mem: 320, res: 128, tier: data }
+  redis-evolution:   { cpu: 0.15, shares: 600,  mem: 96,  res: 48,  tier: data }
+  saleh-evo-app:     { cpu: 0.60, shares: 600,  mem: 512, res: 160, tier: app }
+  saleh-db-evolution:{ cpu: 0.50, shares: 700,  mem: 320, res: 128, tier: data }
+  saleh-redis-evolution: { cpu: 0.15, shares: 600, mem: 96, res: 48, tier: data }
+  cadvisor:          { cpu: 0.25, shares: 128,  mem: 320, res: 128, tier: obs }
+  glances:           { cpu: 0.15, shares: 128,  mem: 224, res: 96,  tier: obs }
+  dozzle:            { cpu: 0.15, shares: 128,  mem: 96,  res: 32,  tier: obs }
+  portainer:         { cpu: 0.20, shares: 256,  mem: 192, res: 64,  tier: obs }
+  uptime-kuma:       { cpu: 0.30, shares: 256,  mem: 256, res: 64,  tier: obs }
+  watchtower:        { cpu: 0.40, shares: 128,  mem: 128, res: 32,  tier: ops }
+  maintenance-page:  { cpu: 0.10, shares: 256,  mem: 32,  res: 16,  tier: edge }
+  samanet-tv:        { cpu: 0.20, shares: 512,  mem: 48,  res: 16,  tier: app }
+  admin-api:         { cpu: 0.35, shares: 300,  mem: 256, res: 64,  tier: app }
+  browserless:       { cpu: 0.90, shares: 200,  mem: 1024, res: 128, tier: batch }
+  mediamtx:          { cpu: 0.50, shares: 400,  mem: 256, res: 48,  tier: app }
+  wttms_keygen:      { cpu: 0.20, shares: 200,  mem: 128, res: 32,  tier: app }
