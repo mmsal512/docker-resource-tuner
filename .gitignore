@@ -22,8 +22,12 @@
 Homestead.json
 Homestead.yaml
 Thumbs.db
-/out
-sizing.yml
+out/*
+!out/.gitkeep
+sizing.local.yml
+.env*
+__pycache__/
+*.pyc
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║              🛡️ Universal .gitignore                       ║
