@@ -6,10 +6,13 @@ rt.py — Docker Resource Tuner
 
   detect  : اطبع موارد السيرفر كما يراها
   plan    : احسب واطبع الخطة (لا يكتب أي ملف)
-  verify  : تحقق من المجاميع والثوابت وميزانية المسار الحرج
+  verify  : تحقق من المجاميع والثوابت وميزانية المسار الحرج وأسماء الخدمات
   render  : ولّد الملفات في out/
   doctor  : اقرأ الاستهلاك الحقيقي من cgroup وأوصِ بتعديلات
   fpm     : قِس عمّال php-fpm داخل حاوية محددة
+
+تنبيه: المفاتيح في apps/static هي أسماء الخدمات (services) في docker-compose.yml
+       وليست أسماء الحاويات (container_name).
 """
 from __future__ import annotations
 
@@ -76,6 +79,11 @@ def deep(d, *keys, default=None):
 def rnd(v: float, step: int = 32) -> int:
     step = max(1, int(step))
     return int(math.ceil(float(v) / step) * step)
+
+
+def app_service(name: str, app: dict) -> str:
+    """اسم الخدمة في docker-compose.yml (service وليس container_name)."""
+    return app.get("service") or app.get("container") or f"{name}-app"
 
 
 # ----------------------------------------------------------------- 1. detect
@@ -172,7 +180,7 @@ def plan_php(name: str, app: dict, d: dict, srv: dict) -> dict:
 
     return {
         "kind": "php-fpm", "tier": "app", "app": name, "managed": True,
-        "container": app.get("container", f"{name}-app"),
+        "service": app_service(name, app),
         "children": children, "demand": demand, "n_cpu": n_cpu,
         "start_servers": start, "min_spare": min_spare, "max_spare": max_spare,
         "cpu": cpu_limit, "cpu_res": round(cpu_limit / 3, 2),
@@ -239,7 +247,7 @@ def build_plan(cfg: dict, srv: dict) -> dict:
     plans = {}
     for name, app in (cfg.get("apps") or {}).items():
         ap = plan_php(name, app, d, srv)
-        plans[ap["container"]] = ap
+        plans[ap["service"]] = ap
         if app.get("db"):
             plans[app["db"]["name"]] = plan_pg(ap, app["db"], d, srv)
         if app.get("cache"):
@@ -249,6 +257,7 @@ def build_plan(cfg: dict, srv: dict) -> dict:
         plans[name] = {
             "kind": "static", "tier": s.get("tier", "app"),
             "managed": bool(s.get("managed", True)),
+            "docker_name": s.get("container", name),
             "cpu": cpu, "cpu_res": round(cpu / 4, 2),
             "mem": int(s["mem"]), "mem_res": int(s["res"]),
             "shares": int(s.get("shares", 512)), "pids": int(s.get("pids", 200)),
@@ -257,6 +266,44 @@ def build_plan(cfg: dict, srv: dict) -> dict:
 
 
 # ----------------------------------------------------------------- 3. verify
+def check_compose(plans: dict, compose_path: str) -> int:
+    """يتأكد أن كل اسم في sizing.yml هو اسم خدمة موجود فعلاً في docker-compose.yml."""
+    if not compose_path:
+        print("\nتلميح: مرّر --compose /path/docker-compose.yml للتحقق من تطابق أسماء الخدمات")
+        return 0
+    p = Path(compose_path).expanduser()
+    if not p.exists():
+        print(f"\nWARN: لم أجد ملف compose على المسار {p} — تخطّي فحص الأسماء")
+        return 0
+    if not yaml:
+        print("\nWARN: PyYAML غير مثبت — تخطّي فحص الأسماء")
+        return 0
+    try:
+        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        print(f"\nWARN: تعذّر تحليل {p}: {e}")
+        return 0
+
+    svcs = set((data.get("services") or {}).keys())
+    managed = {n for n, pl in plans.items() if pl.get("managed", True)}
+    unmanaged = {n for n, pl in plans.items() if not pl.get("managed", True)}
+    missing = sorted(managed - svcs)
+    extra = sorted(svcs - managed - unmanaged)
+    bad = 0
+
+    print("\n--- تطابق الأسماء مع docker-compose.yml ---")
+    if missing:
+        print(f"FAIL: أسماء في sizing.yml ليست خدمات في compose: {missing}")
+        print("      استخدم اسم الخدمة لا اسم الحاوية، وإلا فشل docker compose برسالة")
+        print("      'service has neither an image nor a build context specified'")
+        bad = 1
+    if extra:
+        print(f"WARN: خدمات في compose بلا حدود موارد (drift): {extra}")
+    if not missing and not extra:
+        print("مطابق تماماً")
+    return bad
+
+
 def verify_critical_path(cfg: dict, plans: dict, srv: dict) -> int:
     cp = cfg.get("critical_path") or {}
     chains = cp.get("chains") or []
@@ -297,7 +344,7 @@ def verify_critical_path(cfg: dict, plans: dict, srv: dict) -> int:
     return bad
 
 
-def verify(cfg: dict, plans: dict, srv: dict) -> int:
+def verify(cfg: dict, plans: dict, srv: dict, compose_path: str = "") -> int:
     sl = sum(p["mem"] for p in plans.values())
     sr = sum(p["mem_res"] for p in plans.values())
     sc = sum(p["cpu"] for p in plans.values())
@@ -308,7 +355,7 @@ def verify(cfg: dict, plans: dict, srv: dict) -> int:
     print(f"\nالسيرفر ({srv['source']}): RAM={srv['mem_total_mb']}M  vCPU={srv['vcpu']}  "
           f"swap={srv['swap_mb']}M  cgroup={srv['cgroup']}")
     print(f"احتياطي المضيف={srv['host_reserve_mb']}M  المتاح={alloc}M  "
-          f"حاويات={len(plans)} (منها {len(unmanaged)} خارج compose)")
+          f"خدمات={len(plans)} (منها {len(unmanaged)} خارج compose)")
     print(f"Σ limits       = {sl}M   ({sl / alloc:.2f}× المتاح، الحد {srv['mem_overcommit']})")
     print(f"Σ reservations = {sr}M   ({sr / alloc:.2f}× المتاح، الحد {srv['reservation_ratio']})")
     print(f"Σ cpu limits   = {sc:.2f} ({sc / srv['vcpu']:.1f}× vCPU — سقوف لا حجوزات)")
@@ -339,6 +386,7 @@ def verify(cfg: dict, plans: dict, srv: dict) -> int:
             bad = 1
 
     bad |= verify_critical_path(cfg, plans, srv)
+    bad |= check_compose(plans, compose_path)
     print("\nالنتيجة: " + ("فشل — عالج ما سبق" if bad else "سليم"))
     return bad
 
@@ -504,23 +552,27 @@ def render(cfg: dict, plans: dict, srv: dict, out: Path) -> None:
 
     for name, p in sorted(plans.items()):
         if not p.get("managed", True):
+            dn = p.get("docker_name", name)
             unmanaged_cmds.append(
                 f"docker update --cpus {p['cpu']:.2f} --cpu-shares {p['shares']} "
                 f"--memory {p['mem']}m --memory-swap {p['mem']}m "
-                f"--memory-reservation {p['mem_res']}m --pids-limit {p['pids']} {name}")
+                f"--memory-reservation {p['mem_res']}m --pids-limit {p['pids']} {dn}")
             continue
 
+        # ملاحظة: pids تُوضع داخل deploy.resources.limits حصراً.
+        # وضعها أيضاً كـ pids_limit في مستوى الخدمة يُسبّب:
+        # "can't set distinct values on 'pids_limit' and 'deploy.resources.limits.pids'"
         b = [f"  {name}:",
              "    deploy:",
              "      resources:",
              "        limits:",
              f"          cpus: '{p['cpu']:.2f}'",
              f"          memory: {p['mem']}M",
+             f"          pids: {p['pids']}",
              "        reservations:",
              f"          cpus: '{p['cpu_res']:.2f}'",
              f"          memory: {p['mem_res']}M",
-             f"    cpu_shares: {p['shares']}",
-             f"    pids_limit: {p['pids']}"]
+             f"    cpu_shares: {p['shares']}"]
         if p["tier"] == "data":
             b.append("    oom_score_adj: -500")
         elif p["tier"] in ("obs", "ops", "batch"):
@@ -545,6 +597,7 @@ def render(cfg: dict, plans: dict, srv: dict, out: Path) -> None:
 
     write(out / "docker-compose.resources.yml",
           "# مُولَّد بواسطة rt.py — لا تعدّله يدوياً.\n"
+          "# المفاتيح أدناه هي أسماء الخدمات (services) في docker-compose.yml\n"
           "# التطبيق:\n"
           "#   docker compose -f docker-compose.yml \\\n"
           f"#     -f {prefix}/docker-compose.resources.yml up -d\n"
@@ -553,12 +606,12 @@ def render(cfg: dict, plans: dict, srv: dict, out: Path) -> None:
     if unmanaged_cmds:
         write(out / "unmanaged-apply.sh",
               "#!/usr/bin/env bash\n"
-              "# حاويات تعمل خارج docker-compose — تُضبط مباشرة.\n"
+              "# حاويات تعمل خارج docker-compose — تُضبط مباشرة بأسماء الحاويات.\n"
               "# تنبيه: هذه الإعدادات تضيع إذا أُعيد إنشاء الحاوية (docker rm/run).\n"
               "set -euo pipefail\n" + "\n".join(unmanaged_cmds) + "\n", mode=0o755)
 
     for name, app in (cfg.get("apps") or {}).items():
-        p = plans[app.get("container", f"{name}-app")]
+        p = plans[app_service(name, app)]
         ph = p["php"]
         listen_block = "" if ph["fpm_listen"] == "keep" else (
             f"listen = {ph['fpm_listen']}\n"
@@ -587,7 +640,7 @@ def render(cfg: dict, plans: dict, srv: dict, out: Path) -> None:
             f"· المتاح **{srv['allocatable_mb']}M**",
             f"- Σ limits **{sum(p['mem'] for p in plans.values())}M** · "
             f"Σ reservations **{sum(p['mem_res'] for p in plans.values())}M**", "",
-            "| حاوية | نوع | CPU | shares | MEM lim | MEM res | children | مُدارة |",
+            "| الخدمة | نوع | CPU | shares | MEM lim | MEM res | children | مُدارة |",
             "|---|---|---|---|---|---|---|---|"]
     for n, p in sorted(plans.items()):
         rows.append(f"| {n} | {p['kind']} | {p['cpu']:.2f} | {p['shares']} | "
@@ -603,6 +656,8 @@ def main():
     ap.add_argument("cmd", choices=["detect", "plan", "verify", "render", "doctor", "fpm"])
     ap.add_argument("-c", "--config", default=str(ROOT / "sizing.yml"))
     ap.add_argument("-o", "--out", default=str(DEFAULT_OUT))
+    ap.add_argument("--compose", default=None,
+                    help="مسار docker-compose.yml للتحقق من تطابق أسماء الخدمات")
     ap.add_argument("--assume-mem", type=int, help="تجاوز الرام المكتشفة (MB)")
     ap.add_argument("--assume-cpu", type=int, help="تجاوز عدد النوى المكتشف")
     ap.add_argument("--container", help="لأمر fpm")
@@ -619,18 +674,20 @@ def main():
     if a.cmd == "detect":
         return print(json.dumps(srv, indent=2, ensure_ascii=False))
 
+    compose_path = a.compose or deep(cfg, "render", "compose_file", default="") or ""
     plans = build_plan(cfg, srv)
+
     if a.cmd == "plan":
         for n, p in sorted(plans.items()):
             flag = "" if p.get("managed", True) else "  [خارج compose]"
             print(f"{n:<24}{p['kind']:<10}cpu={p['cpu']:<6.2f}mem={p['mem']:<6}M "
                   f"res={p['mem_res']:<5}M children={p.get('children', '-')}{flag}")
-        return sys.exit(verify(cfg, plans, srv))
+        return sys.exit(verify(cfg, plans, srv, compose_path))
     if a.cmd == "verify":
-        return sys.exit(verify(cfg, plans, srv))
+        return sys.exit(verify(cfg, plans, srv, compose_path))
 
     render(cfg, plans, srv, Path(a.out))
-    sys.exit(verify(cfg, plans, srv))
+    sys.exit(verify(cfg, plans, srv, compose_path))
 
 
 if __name__ == "__main__":
