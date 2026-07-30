@@ -1,0 +1,300 @@
+# ==========================================================
+# docker-resource-tuner — sizing.yml (Example Configuration)
+# This is the single source of truth for all container
+# resource allocations.  bin/rt.py reads this file.
+#
+# ⚠️ IMPORTANT RULE:
+#    Keys under apps.*.service, static.*, db.name, and
+#    cache.name MUST match the **service** names in your
+#    docker-compose.yml — NOT the container_name values.
+#    Violating this will cause:
+#    "service has neither an image nor a build context specified"
+#
+# 📋 GETTING STARTED:
+#    1. Copy this file:  cp sizing.example.yml sizing.yml
+#    2. Edit sizing.yml with your real values
+#    3. Run:  python3 bin/rt.py detect   (check server resources)
+#    4. Run:  python3 bin/rt.py plan     (preview allocations)
+#    5. Run:  python3 bin/rt.py render   (generate output files)
+# ==========================================================
+version: 1
+
+# ----------------------------------------------------------
+# Server — Physical / VPS resource detection & budgeting
+# ----------------------------------------------------------
+server:
+  # Leave empty to auto-detect from /proc/meminfo.
+  # Set "assume" only when generating from Windows, macOS,
+  # or a CI runner that differs from the target server.
+  assume:
+    mem_total_mb: 8192        # Total RAM in MB  (e.g., 4096 / 8192 / 16384)
+    vcpu: 2                   # Number of vCPUs  (e.g., 2 / 4 / 8)
+
+  host_reserve_mb: 1024       # RAM reserved for the host OS, dockerd, and
+                              # page cache.  Minimum recommendation: 768 MB.
+                              # If omitted, defaults to max(768, 10% of RAM).
+
+  mem_overcommit: 1.35        # Sum of all memory LIMITS must not exceed
+                              # this multiplier × allocatable RAM.
+                              # 1.00 = no overcommit (safest)
+                              # 1.35 = allow 35% overcommit (recommended)
+
+  reservation_ratio: 0.70     # Sum of all memory RESERVATIONS must not
+                              # exceed this ratio × allocatable RAM.
+                              # Keeps guaranteed memory within safe bounds.
+
+  round_mb: 32                # Round memory values to this step (MB).
+                              # Keeps limits aligned and human-readable.
+
+# ----------------------------------------------------------
+# Render — Output paths and compose integration
+# ----------------------------------------------------------
+render:
+  # Absolute path on the *target server* (Linux) where the
+  # "out/" directory will be located.  Used for volume mount
+  # paths in the generated docker-compose.resources.yml.
+  mount_prefix: /opt/docker-resource-tuner/out
+
+  # Optional: path to your docker-compose.yml for automatic
+  # service-name validation during `rt.py verify`.
+  # You can also pass it at runtime with --compose flag.
+  compose_file: ""
+
+# ----------------------------------------------------------
+# Defaults — Baseline constants for each service category
+# These apply to ALL apps unless individually overridden.
+#
+# Values marked [MEASURE] should be replaced with real
+# measurements after ~1 week of production traffic.
+# ----------------------------------------------------------
+defaults:
+  php:
+    # --- Memory ---
+    worker_rss_mb: 70         # [MEASURE] Resident memory per FPM worker.
+                              # Measure with: rt.py fpm --container <name>
+    worker_rss_cli_mb: 110    # [MEASURE] Memory per queue worker / scheduler
+    baseline_mb: 45           # nginx + fpm master + supervisor overhead
+    opcache_mb: 96            # [MEASURE] OPcache size (opcache_get_status())
+    interned_mb: 16           # Interned strings buffer size
+    memory_limit_mb: 192      # php.ini memory_limit per single request
+    max_execution_time: 30    # php.ini max_execution_time (seconds)
+    post_max_size_mb: 12      # php.ini post_max_size
+    upload_max_filesize_mb: 10 # php.ini upload_max_filesize
+    max_accelerated_files: 16229  # OPcache accelerated files count
+    validate_timestamps: 0    # 0 = production (code baked in image)
+                              # 1 = development (watch for file changes)
+    opcache_enable_cli: 0     # 1 doubles memory for every CLI process
+
+    # --- CPU ---
+    cpu_per_request: 0.30     # [MEASURE] CPU core fraction per busy worker
+    cpu_ceiling: 0.60         # Max fraction of server cores for one app
+    min_children: 4           # Minimum FPM workers (floor)
+    max_children_cap: 12      # Maximum FPM workers (ceiling)
+    peak_workers: 1           # Workers that may hit memory_limit (burst)
+    safety: 2.0               # Little's Law safety multiplier
+
+    # --- FPM Config ---
+    pm_mode: dynamic          # dynamic | ondemand | static
+    timezone: UTC             # PHP date.timezone
+    php_conf_dir: /usr/local/etc/php/conf.d       # Path inside container
+    fpm_conf_dir: /usr/local/etc/php-fpm.d        # Path inside container
+    fpm_listen: keep          # "keep" = don't change the image's listen
+                              # or set a socket path like /run/php-fpm.sock
+
+  postgres:
+    work_mem_mb: 4            # PostgreSQL work_mem
+    conn_overhead_mb: 7       # Memory overhead per connection
+    reserve_conns: 6          # Extra connections (pgbouncer, monitoring)
+    cpu: 0.50                 # Default CPU limit for DB containers
+    shares: 900               # CPU shares (relative priority)
+    pg_stat_statements: false # Enable pg_stat_statements extension
+
+  redis:
+    overhead_mb: 16           # Redis process overhead beyond data
+    fill_ratio: 0.75          # Target memory fill ratio
+    cpu: 0.30                 # Default CPU limit for Redis containers
+    shares: 600               # CPU shares (relative priority)
+
+# ----------------------------------------------------------
+# Apps — PHP / Laravel Applications
+#
+# Each app generates:
+#   - FPM worker calculations (Little's Law)
+#   - php.ini  → out/php/<name>.ini
+#   - www.conf → out/php-fpm/<name>.www.conf
+#   - Resource limits in docker-compose.resources.yml
+#
+# Keys:
+#   service   = service name in docker-compose.yml
+#   weight    = high | normal | low  → maps to cpu_shares
+#   traffic   = peak RPS and average response time
+#   workers   = Laravel queue workers and scheduler
+#   overrides = override any value from defaults.php
+#   budget_mb = hard memory cap (optional, auto-calculated
+#               if omitted)
+#   db        = associated PostgreSQL service
+#   cache     = associated Redis service
+# ----------------------------------------------------------
+apps:
+  # ── App 1: Primary application (high priority) ──────────
+  app1:
+    service: app1-web                  # docker-compose service name
+    weight: high                       # high priority → cpu_shares=900
+    traffic: { rps_peak: 10, avg_ms: 150 }  # 10 req/s, 150ms average
+    workers: { queue: 2, scheduler: true }  # 2 queue workers + scheduler
+    db:
+      name: app1-db                    # PostgreSQL service name
+      class: postgres
+    cache:
+      name: app1-redis                 # Redis service name
+      class: redis
+      hot_mb: 48                       # Expected hot dataset size
+      policy: volatile-lru             # Redis eviction policy
+
+  # ── App 2: Secondary application (normal priority) ──────
+  app2:
+    service: app2-web
+    weight: normal
+    traffic: { rps_peak: 5, avg_ms: 200 }
+    workers: { queue: 1, scheduler: true }
+
+    # Override specific defaults for this app
+    overrides:
+      memory_limit_mb: 128             # Lower memory_limit
+      opcache_mb: 64                   # Smaller OPcache
+      worker_rss_mb: 55                # Measured lower RSS
+      timezone: America/New_York       # Different timezone
+
+    db:
+      name: app2-db
+      class: postgres
+      max_connections: 15              # Override default max_connections
+    cache:
+      name: app2-redis
+      class: redis
+      hot_mb: 24
+      policy: allkeys-lru
+
+  # ── App 3: Lightweight app (low priority) ───────────────
+  app3:
+    service: app3-web
+    weight: low                        # low priority → cpu_shares=400
+    traffic: { rps_peak: 2, avg_ms: 100 }
+    budget_mb: 384                     # Hard memory cap
+    db:
+      name: app3-db
+      class: postgres
+    cache:
+      name: app3-redis
+      class: redis
+      hot_mb: 16
+      policy: volatile-lru
+
+# ----------------------------------------------------------
+# Static — Non-PHP services
+#
+# The key IS the service name in docker-compose.yml.
+#
+# Fields:
+#   cpu     = CPU limit (cores)
+#   shares  = CPU shares (relative weight)
+#   mem     = Memory limit (MB)
+#   res     = Memory reservation (MB)
+#   tier    = edge | app | data | obs | ops | batch
+#             (affects OOM priority)
+#   managed = true (default) → included in compose override
+#             false → applied via out/unmanaged-apply.sh
+#   container = real container name (only for managed: false)
+#   pids    = PID limit (default: 200)
+# ----------------------------------------------------------
+static:
+  # ── Edge / Reverse Proxy ────────────────────────────────
+  traefik:
+    cpu: 0.60
+    shares: 1024
+    mem: 192
+    res: 96
+    tier: edge
+
+  # ── Operations / Maintenance ────────────────────────────
+  watchtower:
+    cpu: 0.40
+    shares: 128
+    mem: 128
+    res: 32
+    tier: ops
+
+  # ── Observability / Monitoring ──────────────────────────
+  portainer:
+    cpu: 0.20
+    shares: 256
+    mem: 192
+    res: 64
+    tier: obs
+
+  dozzle:
+    cpu: 0.15
+    shares: 128
+    mem: 96
+    res: 32
+    tier: obs
+
+  uptime-kuma:
+    cpu: 0.30
+    shares: 256
+    mem: 256
+    res: 64
+    tier: obs
+
+  # ── Additional App Services ────────────────────────────
+  n8n:
+    cpu: 1.00
+    shares: 512
+    mem: 768
+    res: 256
+    tier: app
+
+  redis-n8n:
+    cpu: 0.25
+    shares: 600
+    mem: 96
+    res: 48
+    tier: data
+
+  # ── Unmanaged containers (outside docker-compose) ──────
+  # These are budgeted but controlled via `docker update`
+  # through the generated out/unmanaged-apply.sh script.
+  my-vpn:
+    cpu: 0.30
+    shares: 800
+    mem: 128
+    res: 48
+    tier: edge
+    managed: false                     # Not in docker-compose
+    container: my-vpn                  # Real container name
+
+# ----------------------------------------------------------
+# Critical Path — Request-flow budget analysis
+#
+# Define the chain of services that a single user request
+# passes through.  `rt.py verify` checks that:
+#   - Total CPU along the chain ≥ min_headroom × vCPU
+#   - Total CPU along the chain ≤ max_headroom × vCPU
+#   - No single stage drops below min_stage_cpu
+#   - Edge services get ≥ edge_min_share of the chain
+# ----------------------------------------------------------
+critical_path:
+  chains:
+    - name: app1-request
+      services: [traefik, app1-web, app1-db, app1-redis]
+
+    - name: app2-request
+      services: [traefik, app2-web, app2-db, app2-redis]
+
+    - name: app3-request
+      services: [traefik, app3-web, app3-db, app3-redis]
+
+  min_headroom: 1.00      # Chain must reach ≥ 1.0× vCPU when idle
+  max_headroom: 1.80      # Chain should not exceed 1.8× vCPU at burst
+  min_stage_cpu: 0.25     # No stage below 0.25 cores (prevents throttling)
+  edge_min_share: 0.10    # Edge/proxy must get ≥ 10% of chain total

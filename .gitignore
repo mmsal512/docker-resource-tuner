@@ -24,6 +24,7 @@ Homestead.yaml
 Thumbs.db
 out/*
 !out/.gitkeep
+sizing.yml
 sizing.local.yml
 .env*
 __pycache__/
