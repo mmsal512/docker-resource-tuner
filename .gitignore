@@ -29,6 +29,7 @@ sizing.local.yml
 .env*
 __pycache__/
 *.pyc
+*.ini
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║              🛡️ Universal .gitignore                       ║
